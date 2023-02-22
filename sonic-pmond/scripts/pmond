@@ -1,0 +1,91 @@
+#!/usr/bin/python3
+
+##
+#   Copyright (c) 2021 Alibaba Group and Accelink Technologies
+#
+#   Licensed under the Apache License, Version 2.0 (the "License"); you may
+#   not use this file except in compliance with the License. You may obtain
+#   a copy of the License at http://www.apache.org/licenses/LICENSE-2.0
+#   THIS CODE IS PROVIDED ON AN *AS IS* BASIS, WITHOUT WARRANTIES OR
+#   CONDITIONS OF ANY KIND, EITHER EXPRESS OR IMPLIED, INCLUDING WITHOUT
+#   LIMITATION ANY IMPLIED WARRANTIES OR CONDITIONS OF TITLE, FITNESS
+#   FOR A PARTICULAR PURPOSE, MERCHANTABILITY OR NON-INFRINGEMENT.
+#
+#   See the Apache Version 2.0 License for specific language governing
+#   permissions and limitations under the License.
+##
+
+import threading
+import otn_pmon.utils as utils
+import otn_pmon.fan as fan
+import otn_pmon.psu as psu
+import otn_pmon.cu as cu
+import otn_pmon.linecard as linecard
+import otn_pmon.chassis as chassis
+from otn_pmon.device.ttypes import periph_type
+# from sonic_py_common import daemon_base, logger
+
+PMON_INFO_UPDATE_INTERVAL_SECS = 5
+
+class Processor(object) :
+    def __init__(self) :
+        pass
+
+    def data_update(self):
+        print("processor update")
+        for type in range (periph_type.UNKNOWN) :
+            self._update_periph(type)
+
+    def _update_periph(self, type):
+        obj = None
+        start = utils.get_first_slot_id(type)
+        end = utils.get_last_slot_id(type)
+        print(f"{periph_type._VALUES_TO_NAMES[type]} start {start}, end {end}")
+        for i in range (start, end + 1):
+            if type == periph_type.CHASSIS :
+                obj = chassis.Chassis(i)
+            elif type == periph_type.CU :
+                obj = cu.Cu(i)
+            elif type == periph_type.LINECARD :
+                obj = linecard.Linecard(i)
+            elif type == periph_type.PSU :
+                obj = psu.Psu(i)
+            elif type == periph_type.FAN :
+                obj = fan.Fan(i)
+            else :
+                continue
+            obj.synchronize()
+            if obj.get_presence() :
+                obj.update_pm()
+                obj.update_alarm()
+
+class PmondDaemon(threading.Thread):
+    def __init__(self, log_identifier):
+        # super(PmondDaemon, self).__init__(log_identifier)
+        self.stop = threading.Event()
+
+    # Run daemon
+    def run(self):
+        # Start main loop
+        # self.log_info("Start pmond daemon main loop")
+        print("Start pmond daemon main loop")
+
+        while not self.stop.wait(PMON_INFO_UPDATE_INTERVAL_SECS):
+            p = Processor()
+            p.data_update()
+
+        print("Stop pmond daemon main loop")
+        # self.log_info("Stop pmond daemon main loop")
+
+#
+# Main =========================================================================
+#
+
+
+def main():
+    pmond = PmondDaemon("PMON")
+    pmond.run()
+
+
+if __name__ == '__main__':
+    main()
