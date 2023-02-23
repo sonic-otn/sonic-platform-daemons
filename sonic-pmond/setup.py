@@ -1,30 +1,28 @@
 from setuptools import setup
 
 setup(
-    name='sonic-psud',
+    name='sonic-pmond',
     version='1.0',
-    description='PSU daemon for SONiC',
+    description='PMON daemon for SONiC',
     license='Apache 2.0',
-    author='SONiC Team',
-    author_email='linuxnetdev@microsoft.com',
-    url='https://github.com/Azure/sonic-platform-daemons',
-    maintainer='Kevin Wang',
-    maintainer_email='kevinw@mellanox.com',
+    author='SONiC-OTN Team',
+    author_email='sonic-wg-otn@lists.sonicfoundation.dev',
+    url='https://github.com/zhengweitang-zwt/sonic-otn-platform-common',
+    maintainer='xin lei',
     packages=[
         'tests'
     ],
     scripts=[
-        'scripts/psud',
+        'scripts/pmond',
     ],
     setup_requires=[
         'pytest-runner',
         'wheel'
     ],
     tests_require=[
-        'mock>=2.0.0; python_version < "3.3"',
         'pytest',
-        'pytest-cov',
-        'sonic_platform_common'
+        'mock>=2.0.0',
+        'pytest-cov'
     ],
     classifiers=[
         'Development Status :: 4 - Beta',
@@ -35,10 +33,9 @@ setup(
         'License :: OSI Approved :: Apache Software License',
         'Natural Language :: English',
         'Operating System :: POSIX :: Linux',
-        'Programming Language :: Python :: 2.7',
         'Programming Language :: Python :: 3.7',
         'Topic :: System :: Hardware',
     ],
-    keywords='sonic SONiC psu PSU daemon psud PSUD',
+    keywords='sonic SONiC daemon pmond',
     test_suite='setup.get_test_suite'
 )
