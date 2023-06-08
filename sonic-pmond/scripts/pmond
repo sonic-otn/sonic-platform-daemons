@@ -15,77 +15,194 @@
 #   permissions and limitations under the License.
 ##
 
+import os
 import threading
-import otn_pmon.utils as utils
+import time
+import psutil
+import otn_pmon.public as pmon_public
+import otn_pmon.periph as periph
 import otn_pmon.fan as fan
 import otn_pmon.psu as psu
 import otn_pmon.cu as cu
+import otn_pmon.db as db
 import otn_pmon.linecard as linecard
 import otn_pmon.chassis as chassis
-from otn_pmon.device.ttypes import periph_type
-# from sonic_py_common import daemon_base, logger
+from otn_pmon.thrift_api.ttypes import periph_type, reboot_type, power_ctl_type
+from swsscommon import swsscommon
+from sonic_py_common.logger import Logger
 
-PMON_INFO_UPDATE_INTERVAL_SECS = 5
+PMON_INFO_UPDATE_INTERVAL_SECS = 1
 
-class Processor(object) :
-    def __init__(self) :
-        pass
+def reboot(obj, reboot_type_name):
+    periph_type_name = obj.split('-')[0]
+    id = int(obj.split('-')[1])
+    linecard_num = periph.get_periph_number(periph_type.LINECARD)
+    if periph_type_name == "CHASSIS-1":
+        for slot_id in range(1, linecard_num + 1):
+            reboot(f"SLOT-{slot_id}", reboot_type_name)
+        reboot("CU-1", reboot_type_name)
+    elif periph_type_name == "CU-1":
+        r_type = reboot_type.COLD if reboot_type_name == 'COLD' else reboot_type.SOFT
+        pmon_public.periph_reboot(periph_type.CU, id, r_type)
+    else:
+        pmon_public.set_power_control(id, power_ctl_type.OFF)
+        time.sleep(0.5)
+        pmon_public.set_power_control(id, power_ctl_type.ON)
 
-    def data_update(self):
-        print("processor update")
-        for type in range (periph_type.UNKNOWN) :
-            self._update_periph(type)
-
-    def _update_periph(self, type):
-        obj = None
-        start = utils.get_first_slot_id(type)
-        end = utils.get_last_slot_id(type)
-        print(f"{periph_type._VALUES_TO_NAMES[type]} start {start}, end {end}")
-        for i in range (start, end + 1):
-            if type == periph_type.CHASSIS :
-                obj = chassis.Chassis(i)
-            elif type == periph_type.CU :
-                obj = cu.Cu(i)
-            elif type == periph_type.LINECARD :
-                obj = linecard.Linecard(i)
-            elif type == periph_type.PSU :
-                obj = psu.Psu(i)
-            elif type == periph_type.FAN :
-                obj = fan.Fan(i)
-            else :
+def reboot_thread_worker() :
+    dbc = db.Client(db.HOST_DB, db.CONFIG_DB)
+    pubsub = dbc.pub_sub()
+    pubsub.psubscribe("PERIPHERAL_REBOOT_CHANNEL")
+    while True :
+        msg = pubsub.get_message()
+        if msg :
+            data = msg["data"].split(",")
+            if len(data) != 2 :
                 continue
-            obj.synchronize()
-            if obj.get_presence() :
-                obj.update_pm()
-                obj.update_alarm()
+            reboot_entity = data[0]
+            reboot_type_name = data[1]
+            if reboot_entity.startswith("SLOT") and reboot_type_name == "WARM" :
+                PmondDaemon.log.log_info(f"{reboot_entity} warm reboot would not be executed in PMON")
+                continue
 
-class PmondDaemon(threading.Thread):
-    def __init__(self, log_identifier):
-        # super(PmondDaemon, self).__init__(log_identifier)
+            PmondDaemon.log.log_info(f"{reboot_entity} reboot by {reboot_type_name}")
+            reboot(reboot_entity, reboot_type_name)
+        else :
+            time.sleep(1)
+
+def db_event_thread_worker(db_client, table_name, handler) :
+    sel = swsscommon.Select()
+    cst = swsscommon.SubscriberStateTable(db_client.db, table_name)
+    sel.addSelectable(cst)
+
+    while True :
+        state, _ = sel.select()
+        if state != swsscommon.Select.OBJECT :
+            continue
+
+        key, op, fvs = cst.pop()
+        if op != "SET" :
+            continue
+        handler(table_name, key, fvs)
+
+def osc_handler(prefix, key, fvs) :
+    if prefix not in key :
+        return
+
+    slot_id = int(key.split('-')[2])
+    intf = f"eth0.{slot_id + 2}"
+    intf_stats = psutil.net_if_stats().get(intf)
+    if not intf_stats :
+        PmondDaemon.log.log_error(f"interface {intf} does not exist")
+        return
+
+    intf_state = None
+    for fv in fvs :
+        if fv[0] != 'oper-status' :
+            continue
+
+        if fv[1] == 'ACTIVE' and not intf_stats.isup :
+            intf_state = 'up'
+        elif fv[1] == 'INACTIVE' and intf_stats.isup :
+            intf_state = 'down'
+        else :
+            continue
+
+    if not intf_state :
+        return
+
+    cmd = f'ifconfig {intf} {intf_state}'
+    PmondDaemon.log.log_info(cmd)
+    os.system(cmd)
+
+class Processor(threading.Thread) :
+    def __init__(self, type, interval = PMON_INFO_UPDATE_INTERVAL_SECS) :
+        threading.Thread.__init__(self)
+        self.type = type
+        self.interval = interval
         self.stop = threading.Event()
 
+    def get_periph(self, id) :
+        obj = None
+        if self.type == periph_type.CHASSIS :
+            obj = chassis.Chassis(id)
+        elif self.type == periph_type.CU :
+            obj = cu.Cu(id)
+        elif self.type == periph_type.LINECARD :
+            obj = linecard.Linecard(id)
+        elif self.type == periph_type.PSU :
+            obj = psu.Psu(id)
+        elif self.type == periph_type.FAN :
+            obj = fan.Fan(id)
+        return obj
+
+    def update(self) :
+        start = pmon_public.get_first_slot_id(self.type)
+        end = pmon_public.get_last_slot_id(self.type)
+        for i in range (start, end + 1):
+            obj = self.get_periph(i)
+            if not obj :
+                continue
+            obj.synchronize()
+
+    def run(self) :
+        while not self.stop.wait(self.interval) :
+            self.update()
+
+class PmondDaemon() :
+    def __init__(self, log_identifier) :
+        log_facility = Logger.LOG_FACILITY_DAEMON
+        log_option = (Logger.LOG_OPTION_NDELAY | Logger.LOG_OPTION_PID)
+        PmondDaemon.log = Logger(log_identifier, log_facility, log_option)
+        PmondDaemon.log.set_min_log_priority_info()
+
+    def start_reboot_thread(self) :
+        # start reboot channel listener thread
+        reboot_thread = threading.Thread(target = reboot_thread_worker,
+                                         name = "reboot_channel_listener")
+        reboot_thread.start()
+        PmondDaemon.log.log_info("reboot_channel_listener thread start")
+
+    def start_osc_threads(self) :
+        # start osc oper-status listener thread
+        linecard_num = periph.get_periph_number(periph_type.LINECARD)
+        tname = "OSC"
+        for id in range (1, linecard_num + 1) :
+            dbc = db.Client(id, db.STATE_DB, True)
+            if not dbc :
+                continue
+
+            osc_thread = threading.Thread(target = db_event_thread_worker,
+                                          args = (dbc, tname, osc_handler, ),
+                                          name = f"osc_thread_{id}")
+            osc_thread.start()
+            PmondDaemon.log.log_info(f"osc_thread_{id} subscriber thread start")
+
+    def start_periph_threads(self) :
+        # start pmon threads
+        for type in range (periph_type.UNKNOWN) :
+            p = Processor(type)
+            PmondDaemon.log.log_info(f"{periph_type._VALUES_TO_NAMES[type]} thread start")
+            p.start()
+
+    def start_fan_control_thread(self) :
+        fc = fan.FanControl()
+        fc.start()
+        PmondDaemon.log.log_info("fan_control_thread thread start")
+
     # Run daemon
-    def run(self):
-        # Start main loop
-        # self.log_info("Start pmond daemon main loop")
-        print("Start pmond daemon main loop")
-
-        while not self.stop.wait(PMON_INFO_UPDATE_INTERVAL_SECS):
-            p = Processor()
-            p.data_update()
-
-        print("Stop pmond daemon main loop")
-        # self.log_info("Stop pmond daemon main loop")
+    def exec(self):
+        self.start_reboot_thread()
+        self.start_osc_threads()
+        self.start_periph_threads()
+        self.start_fan_control_thread()
 
 #
 # Main =========================================================================
 #
-
-
 def main():
-    pmond = PmondDaemon("PMON")
-    pmond.run()
-
+    pmond = PmondDaemon("PMOND")
+    pmond.exec()
 
 if __name__ == '__main__':
     main()
